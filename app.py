@@ -11,6 +11,7 @@ Correrlo:
 Lee credenciales desde backend/.env (no se sube a ningún repositorio público).
 """
 import os
+import re
 import json
 import time
 import requests
@@ -132,6 +133,10 @@ def crear_preferencia_mercadopago(order):
             "name": customer.get("firstName", ""),
             "surname": customer.get("lastName", ""),
             "email": customer.get("email", ""),
+            "identification": {
+                "type": "RUT",
+                "number": re.sub(r"[^0-9kK]", "", customer.get("rut", "")),
+            },
         },
         "external_reference": str(order["id"]),
         "back_urls": {
