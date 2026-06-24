@@ -152,8 +152,14 @@ def crear_preferencia_mercadopago(order):
     if "localhost" not in SITE_BASE_URL and "127.0.0.1" not in SITE_BASE_URL:
         payload["auto_return"] = "approved"
 
-    if "localhost" not in BACKEND_BASE_URL and "127.0.0.1" not in BACKEND_BASE_URL:
-        payload["notification_url"] = f"{BACKEND_BASE_URL}/api/mercadopago/webhook"
+    backend_base = BACKEND_BASE_URL.strip()
+    if not backend_base or "localhost" in backend_base or "127.0.0.1" in backend_base:
+        # Si la variable de entorno no quedó bien puesta, se calcula sola a
+        # partir de la URL real con la que llegó esta petición (funciona
+        # automáticamente en Render sin depender de configurarla a mano).
+        backend_base = request.host_url.rstrip("/")
+    if "localhost" not in backend_base and "127.0.0.1" not in backend_base:
+        payload["notification_url"] = f"{backend_base}/api/mercadopago/webhook"
 
     resp = requests.post(f"{MP_API_BASE}/checkout/preferences", json=payload, headers=headers)
     resp.raise_for_status()
