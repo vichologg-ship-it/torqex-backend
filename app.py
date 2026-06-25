@@ -128,25 +128,12 @@ def crear_preferencia_mercadopago(order):
     ]
 
     customer = order.get("customer", {})
-    phone_digits = re.sub(r"[^0-9]", "", customer.get("phone", ""))
     payload = {
         "items": items_mp,
         "payer": {
             "name": customer.get("firstName", ""),
             "surname": customer.get("lastName", ""),
             "email": customer.get("email", ""),
-            "phone": {
-                "area_code": "56",
-                "number": phone_digits[-9:] if phone_digits else "",
-            },
-            "address": {
-                "street_name": customer.get("address", ""),
-                "city": customer.get("city", ""),
-            },
-            "identification": {
-                "type": "RUT",
-                "number": re.sub(r"[^0-9kK]", "", customer.get("rut", "")),
-            },
         },
         "external_reference": str(order["id"]),
         "back_urls": {
