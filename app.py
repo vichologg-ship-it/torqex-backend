@@ -27,6 +27,7 @@ CORS(app)
 BSALE_API_TOKEN = os.environ.get("BSALE_API_TOKEN", "")
 BSALE_OFFICE_ID = int(os.environ.get("BSALE_OFFICE_ID", "1"))
 BSALE_DOCUMENT_TYPE_ID = int(os.environ.get("BSALE_DOCUMENT_TYPE_ID", "1"))
+BSALE_FACTURA_DOCUMENT_TYPE_ID = int(os.environ.get("BSALE_FACTURA_DOCUMENT_TYPE_ID", "6"))
 BSALE_IVA_TAX_ID = int(os.environ.get("BSALE_IVA_TAX_ID", "1"))
 BSALE_MP_PAYMENT_TYPE_ID = int(os.environ.get("BSALE_MP_PAYMENT_TYPE_ID", "13"))
 BSALE_API_BASE = "https://api.bsale.io/v1"
@@ -127,12 +128,21 @@ def crear_preferencia_mercadopago(order):
     ]
 
     customer = order.get("customer", {})
+    phone_digits = re.sub(r"[^0-9]", "", customer.get("phone", ""))
     payload = {
         "items": items_mp,
         "payer": {
             "name": customer.get("firstName", ""),
             "surname": customer.get("lastName", ""),
             "email": customer.get("email", ""),
+            "phone": {
+                "area_code": "56",
+                "number": phone_digits[-9:] if phone_digits else "",
+            },
+            "address": {
+                "street_name": customer.get("address", ""),
+                "city": customer.get("city", ""),
+            },
             "identification": {
                 "type": "RUT",
                 "number": re.sub(r"[^0-9kK]", "", customer.get("rut", "")),
@@ -186,20 +196,37 @@ def emitir_boleta(order, payment_amount=None, payment_type_id=None):
             "taxId": [BSALE_IVA_TAX_ID],
         })
 
+    customer = order.get("customer", {})
+    is_factura = customer.get("docType") == "factura"
+
     payload = {
-        "documentTypeId": BSALE_DOCUMENT_TYPE_ID,
+        "documentTypeId": BSALE_FACTURA_DOCUMENT_TYPE_ID if is_factura else BSALE_DOCUMENT_TYPE_ID,
         "officeId": BSALE_OFFICE_ID,
         "emissionDate": int(time.time()),
         "declareSii": 1,
         "details": details,
     }
 
-    customer = order.get("customer", {})
-    if customer.get("email"):
+    rut = re.sub(r"[^0-9kK]", "", customer.get("rut", ""))
+    if is_factura:
+        payload["client"] = {
+            "code": rut,
+            "company": customer.get("razonSocial", ""),
+            "activity": customer.get("giro", ""),
+            "email": customer.get("email", ""),
+            "municipality": customer.get("city", ""),
+            "city": customer.get("city", ""),
+            "address": customer.get("address", ""),
+        }
+    elif customer.get("email"):
         payload["client"] = {
             "firstName": customer.get("firstName", ""),
             "lastName": customer.get("lastName", ""),
             "email": customer.get("email", ""),
+            "code": rut,
+            "municipality": customer.get("city", ""),
+            "city": customer.get("city", ""),
+            "address": customer.get("address", ""),
         }
 
     if payment_amount is not None:
