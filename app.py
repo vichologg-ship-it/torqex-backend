@@ -12,10 +12,10 @@ Lee credenciales desde backend/.env (no se sube a ningún repositorio público).
 """
 import os
 import re
-import json
 import time
+import secrets
 import requests
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -39,23 +39,113 @@ MP_API_BASE = "https://api.mercadopago.com"
 SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "http://localhost:8000")
 BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:5000")
 
-ORDERS_FILE = os.path.join(os.path.dirname(__file__), "orders.json")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "torqex")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Moka56")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 
-def load_orders():
-    if os.path.exists(ORDERS_FILE):
-        with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+def require_admin():
+    """Protege endpoints internos (listar pedidos, emitir boleta a mano) para
+    que no cualquiera en internet pueda ver datos de clientes o emitir
+    documentos. Hay que configurar ADMIN_API_KEY en Render y mandarla en el
+    header X-Admin-Key. El panel de administración (admin.html) la obtiene
+    automáticamente al iniciar sesión en /api/admin/login."""
+    if not ADMIN_API_KEY or request.headers.get("X-Admin-Key") != ADMIN_API_KEY:
+        abort(401)
 
 
-def save_orders(orders):
-    with open(ORDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(orders, f, ensure_ascii=False, indent=2)
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    """Login del panel de administración (admin.html). Devuelve la clave
+    que el panel debe mandar en el header X-Admin-Key en el resto de
+    peticiones a /api/orders, etc."""
+    data = request.get_json(force=True) or {}
+    if data.get("username") != ADMIN_USERNAME or data.get("password") != ADMIN_PASSWORD:
+        return jsonify({"error": "usuario o contraseña incorrectos"}), 401
+    if not ADMIN_API_KEY:
+        return jsonify({"error": "ADMIN_API_KEY no está configurada en el servidor"}), 500
+    return jsonify({"ok": True, "token": ADMIN_API_KEY})
 
 
-def find_order(orders, order_id):
-    return next((o for o in orders if o["id"] == order_id), None)
+def _supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def _supabase_request(method, path, params=None, json_body=None):
+    resp = requests.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers=_supabase_headers(),
+        params=params,
+        json=json_body,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json() if resp.text else None
+
+
+def _row_to_order(row):
+    """Convierte una fila de la tabla `orders` de Supabase al formato que
+    usa el resto del código (mismas claves que antes con orders.json)."""
+    return {
+        "id": row["id"],
+        "token": row["token"],
+        "items": row["items"],
+        "customer": row["customer"],
+        "total": row["total"],
+        "status": row["status"],
+        "createdAt": row.get("created_at"),
+        "bsaleDocument": row.get("bsale_document"),
+        "mercadopagoPaymentId": row.get("mercadopago_payment_id"),
+        "bsaleError": row.get("bsale_error"),
+    }
+
+
+def create_order(items, customer, total):
+    """Crea un pedido nuevo en Supabase y devuelve el pedido creado (con su
+    id real asignado por la base de datos)."""
+    body = {
+        "token": secrets.token_urlsafe(24),
+        "items": items,
+        "customer": customer,
+        "total": total,
+        "status": "pendiente_pago",
+    }
+    rows = _supabase_request("POST", "orders", json_body=body)
+    return _row_to_order(rows[0])
+
+
+def get_order_by_id(order_id):
+    rows = _supabase_request("GET", "orders", params={"id": f"eq.{order_id}", "select": "*"})
+    return _row_to_order(rows[0]) if rows else None
+
+
+def list_all_orders():
+    rows = _supabase_request("GET", "orders", params={"select": "*", "order": "id.asc"})
+    return [_row_to_order(r) for r in rows]
+
+
+_ORDER_FIELD_TO_COLUMN = {
+    "status": "status",
+    "bsaleDocument": "bsale_document",
+    "mercadopagoPaymentId": "mercadopago_payment_id",
+    "bsaleError": "bsale_error",
+}
+
+
+def update_order(order_id, fields):
+    """Actualiza uno o más campos de un pedido (recibe claves en el mismo
+    formato que usa el resto del código, ej. {"status": "boleta_emitida"})."""
+    body = {_ORDER_FIELD_TO_COLUMN.get(k, k): v for k, v in fields.items()}
+    _supabase_request("PATCH", "orders", params={"id": f"eq.{order_id}"}, json_body=body)
 
 
 @app.route("/api/health", methods=["GET"])
@@ -79,17 +169,8 @@ def checkout():
     if not items:
         return jsonify({"error": "carrito vacío"}), 400
 
-    orders = load_orders()
-    order = {
-        "id": len(orders) + 1,
-        "items": items,
-        "customer": customer,
-        "total": sum(i["price"] * i["qty"] for i in items),
-        "status": "pendiente_pago",
-        "createdAt": int(time.time()),
-    }
-    orders.append(order)
-    save_orders(orders)
+    total = sum(i["price"] * i["qty"] for i in items)
+    order = create_order(items, customer, total)
 
     init_point = None
     mp_error = None
@@ -137,9 +218,9 @@ def crear_preferencia_mercadopago(order):
         },
         "external_reference": str(order["id"]),
         "back_urls": {
-            "success": f"{SITE_BASE_URL}/checkout-resultado.html?status=success&order_id={order['id']}",
-            "failure": f"{SITE_BASE_URL}/checkout-resultado.html?status=failure&order_id={order['id']}",
-            "pending": f"{SITE_BASE_URL}/checkout-resultado.html?status=pending&order_id={order['id']}",
+            "success": f"{SITE_BASE_URL}/checkout-resultado.html?status=success&order_id={order['id']}&token={order['token']}",
+            "failure": f"{SITE_BASE_URL}/checkout-resultado.html?status=failure&order_id={order['id']}&token={order['token']}",
+            "pending": f"{SITE_BASE_URL}/checkout-resultado.html?status=pending&order_id={order['id']}&token={order['token']}",
         },
     }
 
@@ -233,16 +314,14 @@ def bsale_document():
     """Emite manualmente la boleta de un pedido ya registrado (uso interno,
     por ejemplo si el pago se confirmó por transferencia/efectivo en vez de
     Mercado Pago)."""
+    require_admin()
     order_id = request.get_json(force=True).get("order_id")
-    orders = load_orders()
-    order = find_order(orders, order_id)
+    order = get_order_by_id(order_id)
     if not order:
         return jsonify({"error": "pedido no encontrado"}), 404
     try:
         doc = emitir_boleta(order)
-        order["status"] = "boleta_emitida"
-        order["bsaleDocument"] = doc
-        save_orders(orders)
+        update_order(order_id, {"status": "boleta_emitida", "bsaleDocument": doc})
         return jsonify(doc)
     except requests.HTTPError as e:
         return jsonify({"error": "bsale_error", "detail": e.response.text}), 502
@@ -280,8 +359,7 @@ def mercadopago_webhook():
         return jsonify({"ok": True, "status": payment.get("status")})
 
     order_id = int(payment.get("external_reference"))
-    orders = load_orders()
-    order = find_order(orders, order_id)
+    order = get_order_by_id(order_id)
     if not order:
         return jsonify({"ok": False, "error": "pedido no encontrado"}), 404
 
@@ -290,14 +368,13 @@ def mercadopago_webhook():
 
     try:
         doc = emitir_boleta(order, payment_amount=payment.get("transaction_amount"))
-        order["status"] = "boleta_emitida"
-        order["bsaleDocument"] = doc
-        order["mercadopagoPaymentId"] = payment_id
-        save_orders(orders)
+        update_order(order_id, {
+            "status": "boleta_emitida",
+            "bsaleDocument": doc,
+            "mercadopagoPaymentId": payment_id,
+        })
     except Exception as e:
-        order["status"] = "pagado_sin_boleta"
-        order["bsaleError"] = str(e)
-        save_orders(orders)
+        update_order(order_id, {"status": "pagado_sin_boleta", "bsaleError": str(e)})
         return jsonify({"ok": False, "error": str(e)}), 500
 
     return jsonify({"ok": True})
@@ -305,17 +382,24 @@ def mercadopago_webhook():
 
 @app.route("/api/orders/<int:order_id>", methods=["GET"])
 def get_order(order_id):
-    """Consulta el estado de un pedido (lo usa checkout-resultado.html)."""
-    order = find_order(load_orders(), order_id)
+    """Consulta el estado de un pedido (lo usa checkout-resultado.html).
+    Exige el token aleatorio del pedido (va en la URL de vuelta de Mercado
+    Pago) para que nadie pueda ver los datos de otro cliente adivinando el
+    número de pedido."""
+    order = get_order_by_id(order_id)
     if not order:
         return jsonify({"error": "pedido no encontrado"}), 404
+    if not order.get("token") or request.args.get("token") != order["token"]:
+        return jsonify({"error": "no autorizado"}), 401
     return jsonify(order)
 
 
 @app.route("/api/orders", methods=["GET"])
 def list_orders():
-    """Lista simple de pedidos para revisión manual (uso interno)."""
-    return jsonify(load_orders())
+    """Lista simple de pedidos para revisión manual (uso interno, exige
+    ADMIN_API_KEY)."""
+    require_admin()
+    return jsonify(list_all_orders())
 
 
 _stock_cache = {}  # sku -> (timestamp, quantityAvailable)
