@@ -15,6 +15,7 @@ import re
 import time
 import secrets
 import requests
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, redirect, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -400,6 +401,153 @@ def list_orders():
     ADMIN_API_KEY)."""
     require_admin()
     return jsonify(list_all_orders())
+
+
+def _row_to_product(row):
+    """Convierte una fila de la tabla `products` de Supabase al formato que
+    usa el frontend (catalogo.html, producto.html, index.html)."""
+    return {
+        "id": row["id"],
+        "dept": row.get("dept"),
+        "deptSlug": row.get("dept_slug"),
+        "name": row.get("name"),
+        "variant": row.get("variant"),
+        "sku": row.get("sku"),
+        "brand": row.get("brand"),
+        "price": row.get("price"),
+        "image": row.get("image"),
+        "stock": row.get("stock"),
+    }
+
+
+@app.route("/api/products", methods=["GET"])
+def public_products():
+    """Catálogo público: lo consumen index.html, catalogo.html y
+    producto.html. Lee directo de Supabase, así que cualquier cambio hecho
+    desde el panel de administración se ve de inmediato en el sitio."""
+    rows = _supabase_fetch_all("products", {"select": "*", "active": "eq.true", "order": "id.asc"})
+    return jsonify([_row_to_product(r) for r in rows])
+
+
+def _supabase_fetch_all(path, params, page_size=1000):
+    """Supabase limita cada consulta a 1000 filas por defecto; esto junta
+    todas las páginas (necesario porque el catálogo tiene más de 1000
+    productos)."""
+    all_rows = []
+    offset = 0
+    while True:
+        page_params = dict(params)
+        page_params["limit"] = page_size
+        page_params["offset"] = offset
+        page = _supabase_request("GET", path, params=page_params) or []
+        all_rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return all_rows
+
+
+@app.route("/api/admin/products", methods=["GET"])
+def admin_list_products():
+    """Lista/busca productos para el panel de administración (exige
+    ADMIN_API_KEY)."""
+    require_admin()
+    q = request.args.get("q", "").strip()
+    params = {"select": "*", "order": "name.asc", "limit": "60"}
+    if q:
+        params["name"] = f"ilike.*{q}*"
+    rows = _supabase_request("GET", "products", params=params)
+    return jsonify([_row_to_product(r) for r in rows])
+
+
+@app.route("/api/admin/products", methods=["POST"])
+def admin_create_product():
+    """Crea un producto nuevo desde el panel (exige ADMIN_API_KEY)."""
+    require_admin()
+    data = request.get_json(force=True) or {}
+    if not data.get("name"):
+        return jsonify({"error": "falta el nombre del producto"}), 400
+    new_id = data.get("sku") or secrets.token_urlsafe(8)
+    body = {
+        "id": new_id,
+        "dept": data.get("dept") or "",
+        "dept_slug": data.get("deptSlug") or "",
+        "name": data["name"],
+        "variant": data.get("variant") or "",
+        "sku": data.get("sku") or "",
+        "brand": data.get("brand") or "",
+        "price": data.get("price", 0),
+        "image": data.get("image") or "assets/img/_placeholder.svg",
+        "stock": data.get("stock"),
+    }
+    rows = _supabase_request("POST", "products", json_body=body)
+    return jsonify(_row_to_product(rows[0])), 201
+
+
+_PRODUCT_FIELD_TO_COLUMN = {
+    "deptSlug": "dept_slug",
+}
+
+
+@app.route("/api/admin/products/<product_id>", methods=["PATCH"])
+def admin_update_product(product_id):
+    """Edita uno o más campos de un producto (precio, stock, nombre, foto,
+    etc.) desde el panel. Exige ADMIN_API_KEY."""
+    require_admin()
+    data = request.get_json(force=True) or {}
+    allowed = {"dept", "deptSlug", "name", "variant", "sku", "brand", "price", "image", "stock", "active"}
+    body = {_PRODUCT_FIELD_TO_COLUMN.get(k, k): v for k, v in data.items() if k in allowed}
+    if not body:
+        return jsonify({"error": "no hay campos para actualizar"}), 400
+    body["updated_at"] = datetime.now(timezone.utc).isoformat()
+    rows = _supabase_request("PATCH", "products", params={"id": f"eq.{product_id}"}, json_body=body)
+    if not rows:
+        return jsonify({"error": "producto no encontrado"}), 404
+    return jsonify(_row_to_product(rows[0]))
+
+
+@app.route("/api/admin/products/<product_id>", methods=["DELETE"])
+def admin_delete_product(product_id):
+    """Elimina un producto del catálogo (exige ADMIN_API_KEY)."""
+    require_admin()
+    _supabase_request("DELETE", "products", params={"id": f"eq.{product_id}"})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/products/<product_id>/image", methods=["POST"])
+def admin_upload_product_image(product_id):
+    """Sube una foto nueva para un producto al storage de Supabase y
+    actualiza su campo `image` con la URL pública resultante."""
+    require_admin()
+    if "file" not in request.files:
+        return jsonify({"error": "falta el archivo"}), 400
+    file = request.files["file"]
+    ext = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
+    storage_path = f"{product_id}-{secrets.token_hex(4)}{ext}"
+    file_bytes = file.read()
+
+    upload_resp = requests.post(
+        f"{SUPABASE_URL}/storage/v1/object/product-images/{storage_path}",
+        headers={
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": file.mimetype or "application/octet-stream",
+        },
+        data=file_bytes,
+        timeout=30,
+    )
+    if upload_resp.status_code >= 300:
+        return jsonify({"error": "no se pudo subir la imagen", "detail": upload_resp.text}), 502
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/product-images/{storage_path}"
+    rows = _supabase_request(
+        "PATCH", "products",
+        params={"id": f"eq.{product_id}"},
+        json_body={"image": public_url, "updated_at": datetime.now(timezone.utc).isoformat()},
+    )
+    if not rows:
+        return jsonify({"error": "producto no encontrado"}), 404
+    return jsonify(_row_to_product(rows[0]))
 
 
 _stock_cache = {}  # sku -> (timestamp, quantityAvailable)
