@@ -417,6 +417,7 @@ def _row_to_product(row):
         "price": row.get("price"),
         "image": row.get("image"),
         "stock": row.get("stock"),
+        "description": row.get("description"),
     }
 
 
@@ -495,7 +496,7 @@ def admin_update_product(product_id):
     etc.) desde el panel. Exige ADMIN_API_KEY."""
     require_admin()
     data = request.get_json(force=True) or {}
-    allowed = {"dept", "deptSlug", "name", "variant", "sku", "brand", "price", "image", "stock", "active"}
+    allowed = {"dept", "deptSlug", "name", "variant", "sku", "brand", "price", "image", "stock", "active", "description"}
     body = {_PRODUCT_FIELD_TO_COLUMN.get(k, k): v for k, v in data.items() if k in allowed}
     if not body:
         return jsonify({"error": "no hay campos para actualizar"}), 400
