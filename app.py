@@ -418,6 +418,7 @@ def _row_to_product(row):
         "image": row.get("image"),
         "stock": row.get("stock"),
         "description": row.get("description"),
+        "active": row.get("active", True),
     }
 
 
