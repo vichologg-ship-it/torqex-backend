@@ -567,12 +567,15 @@ def _run_bsale_sync():
         existing_skus = {r["sku"] for r in existing_rows if r.get("sku")}
 
         added = 0
-        updated = 0
+        skipped = 0
         errors = []
 
+        new_products = []
         for v in variants:
             code = (v.get("code") or "").strip()
-            if not code:
+            if not code or code in existing_skus:
+                if code:
+                    skipped += 1
                 continue
 
             prod_href = (v.get("product") or {}).get("href", "")
@@ -588,37 +591,30 @@ def _run_bsale_sync():
 
             stock = variant_stock.get(str(v["id"]))
 
-            if code in existing_skus:
-                try:
-                    body = {"price": price, "updated_at": datetime.now(timezone.utc).isoformat()}
-                    if stock is not None:
-                        body["stock"] = stock
-                    _supabase_request("PATCH", "products", params={"sku": f"eq.{code}"}, json_body=body)
-                    updated += 1
-                except Exception as e:
-                    errors.append(f"update {code}: {e}")
-            else:
-                try:
-                    body = {
-                        "id": code,
-                        "sku": code,
-                        "name": name,
-                        "variant": v.get("description", ""),
-                        "dept": dept,
-                        "dept_slug": _slugify(dept) if dept else "",
-                        "brand": "",
-                        "price": price,
-                        "stock": stock,
-                        "image": "assets/img/_placeholder.svg",
-                        "active": True,
-                    }
-                    _supabase_request("POST", "products", json_body=body)
-                    existing_skus.add(code)
-                    added += 1
-                except Exception as e:
-                    errors.append(f"create {code}: {e}")
+            new_products.append({
+                "id": code,
+                "sku": code,
+                "name": name,
+                "variant": v.get("description", ""),
+                "dept": dept,
+                "dept_slug": _slugify(dept) if dept else "",
+                "brand": "",
+                "price": price,
+                "stock": stock,
+                "image": "assets/img/_placeholder.svg",
+                "active": True,
+            })
+            existing_skus.add(code)
 
-        _sync_status["result"] = {"added": added, "updated": updated, "errors": errors[:20]}
+        for batch_start in range(0, len(new_products), 50):
+            batch = new_products[batch_start:batch_start + 50]
+            try:
+                _supabase_request("POST", "products", json_body=batch)
+                added += len(batch)
+            except Exception as e:
+                errors.append(f"batch {batch_start}: {e}")
+
+        _sync_status["result"] = {"added": added, "skipped": skipped, "errors": errors[:20]}
     except Exception as e:
         _sync_status["result"] = {"error": str(e)}
     finally:
