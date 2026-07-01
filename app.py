@@ -556,6 +556,14 @@ def _run_bsale_sync():
 
         variants = bsale_fetch_all("variants.json")
 
+        price_details = bsale_fetch_all("price_lists/3/details.json")
+        variant_price = {}
+        for pd in price_details:
+            vid = str(pd.get("id", ""))
+            price_val = pd.get("variantValueWithTaxes", 0)
+            if vid and price_val:
+                variant_price[vid] = int(round(float(price_val)))
+
         stocks_raw = bsale_fetch_all("stocks.json", params={"officeid": BSALE_OFFICE_ID})
         variant_stock = {}
         for s in stocks_raw:
@@ -571,11 +579,20 @@ def _run_bsale_sync():
         errors = []
 
         new_products = []
+        price_fixes = []
         for v in variants:
             code = (v.get("code") or "").strip()
-            if not code or code in existing_skus:
-                if code:
-                    skipped += 1
+            if not code:
+                continue
+
+            vid = str(v["id"])
+            price = variant_price.get(vid, 0)
+            stock = variant_stock.get(vid)
+
+            if code in existing_skus:
+                skipped += 1
+                if price > 0:
+                    price_fixes.append({"sku": code, "price": price, "stock": stock})
                 continue
 
             prod_href = (v.get("product") or {}).get("href", "")
@@ -583,13 +600,6 @@ def _run_bsale_sync():
             info = product_info.get(prod_id, {})
             dept = info.get("type_name", "")
             name = info.get("name", v.get("description", "Producto"))
-
-            try:
-                price = int(round(float(v.get("finalPrice", 0) or 0)))
-            except (TypeError, ValueError):
-                price = 0
-
-            stock = variant_stock.get(str(v["id"]))
 
             new_products.append({
                 "id": code,
@@ -614,7 +624,18 @@ def _run_bsale_sync():
             except Exception as e:
                 errors.append(f"batch {batch_start}: {e}")
 
-        _sync_status["result"] = {"added": added, "skipped": skipped, "errors": errors[:20]}
+        price_fixed = 0
+        for fix in price_fixes:
+            try:
+                body = {"price": fix["price"], "updated_at": datetime.now(timezone.utc).isoformat()}
+                if fix["stock"] is not None:
+                    body["stock"] = fix["stock"]
+                _supabase_request("PATCH", "products", params={"sku": f"eq.{fix['sku']}"}, json_body=body)
+                price_fixed += 1
+            except Exception as e:
+                errors.append(f"price fix {fix['sku']}: {e}")
+
+        _sync_status["result"] = {"added": added, "skipped": skipped, "price_fixed": price_fixed, "errors": errors[:20]}
     except Exception as e:
         _sync_status["result"] = {"error": str(e)}
     finally:
