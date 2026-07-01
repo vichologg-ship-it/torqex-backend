@@ -508,6 +508,119 @@ def admin_update_product(product_id):
     return jsonify(_row_to_product(rows[0]))
 
 
+@app.route("/api/admin/sync-bsale", methods=["POST"])
+def admin_sync_bsale():
+    """Sincroniza productos desde Bsale: agrega los nuevos (por SKU) y
+    actualiza precio y stock de los existentes."""
+    require_admin()
+    if not BSALE_API_TOKEN:
+        return jsonify({"error": "BSALE_API_TOKEN no configurado"}), 500
+
+    bsale_headers = {"access_token": BSALE_API_TOKEN}
+
+    def bsale_fetch_all(path, params=None):
+        items = []
+        offset = 0
+        limit = 50
+        params = dict(params or {})
+        while True:
+            params.update({"limit": limit, "offset": offset})
+            resp = requests.get(f"{BSALE_API_BASE}/{path}", headers=bsale_headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            items.extend(data.get("items", []))
+            if len(data.get("items", [])) < limit:
+                break
+            offset += limit
+        return items
+
+    product_types = bsale_fetch_all("product_types.json")
+    type_map = {str(pt["id"]): pt["name"] for pt in product_types}
+
+    bsale_products = bsale_fetch_all("products.json")
+    product_info = {}
+    for p in bsale_products:
+        pt_href = (p.get("product_type") or {}).get("href", "")
+        pt_id = pt_href.rstrip(".json").split("/")[-1] if pt_href else ""
+        product_info[str(p["id"])] = {
+            "name": p.get("name", ""),
+            "type_name": type_map.get(pt_id, ""),
+        }
+
+    variants = bsale_fetch_all("variants.json")
+
+    stocks_raw = bsale_fetch_all("stocks.json", params={"officeid": BSALE_OFFICE_ID})
+    variant_stock = {}
+    for s in stocks_raw:
+        vid = str((s.get("variant") or {}).get("id", ""))
+        if vid:
+            variant_stock[vid] = s.get("quantityAvailable", 0)
+
+    existing_rows = _supabase_fetch_all("products", {"select": "sku"})
+    existing_skus = {r["sku"] for r in existing_rows if r.get("sku")}
+
+    added = 0
+    updated = 0
+    errors = []
+
+    import unicodedata as _ud
+
+    def _slugify(text):
+        text = _ud.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+        return text or "item"
+
+    for v in variants:
+        code = (v.get("code") or "").strip()
+        if not code:
+            continue
+
+        prod_href = (v.get("product") or {}).get("href", "")
+        prod_id = prod_href.rstrip(".json").split("/")[-1] if prod_href else ""
+        info = product_info.get(prod_id, {})
+        dept = info.get("type_name", "")
+        name = info.get("name", v.get("description", "Producto"))
+
+        try:
+            price = int(round(float(v.get("finalPrice", 0) or 0)))
+        except (TypeError, ValueError):
+            price = 0
+
+        stock = variant_stock.get(str(v["id"]))
+
+        if code in existing_skus:
+            try:
+                body = {"price": price, "updated_at": datetime.now(timezone.utc).isoformat()}
+                if stock is not None:
+                    body["stock"] = stock
+                _supabase_request("PATCH", "products", params={"sku": f"eq.{code}"}, json_body=body)
+                updated += 1
+            except Exception as e:
+                errors.append(f"update {code}: {e}")
+        else:
+            try:
+                body = {
+                    "id": code,
+                    "sku": code,
+                    "name": name,
+                    "variant": v.get("description", ""),
+                    "dept": dept,
+                    "dept_slug": _slugify(dept) if dept else "",
+                    "brand": "",
+                    "price": price,
+                    "stock": stock,
+                    "image": "assets/img/_placeholder.svg",
+                    "active": True,
+                }
+                _supabase_request("POST", "products", json_body=body)
+                existing_skus.add(code)
+                added += 1
+            except Exception as e:
+                errors.append(f"create {code}: {e}")
+
+    return jsonify({"added": added, "updated": updated, "errors": errors[:20]})
+
+
 @app.route("/api/admin/products/<product_id>", methods=["DELETE"])
 def admin_delete_product(product_id):
     """Elimina un producto del catálogo (exige ADMIN_API_KEY)."""
